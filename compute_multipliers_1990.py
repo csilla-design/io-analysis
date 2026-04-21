@@ -110,31 +110,74 @@ for row in data.iter_rows(min_row=4, values_only=True):
 safe_x = np.where(x > 0, x, 1.0)
 
 # ---------------------------------------------------------------------------
-# 2. Build A, Leontief inverse, and per-sector Type I multipliers
+# 2. Build A, Leontief inverse, and per-sector Type I + Type II multipliers
 # ---------------------------------------------------------------------------
 A = Z / safe_x                                # column-normalized A
-L = np.linalg.inv(np.eye(N) - A)
+L = np.linalg.inv(np.eye(N) - A)              # Type I Leontief inverse
 
-# Direct coefficients for value-added, imports, labor
-h = wages / safe_x                            # labor compensation coefficient
+# Direct coefficients for value-added, imports, and labor (two proxies)
+h_wages = wages / safe_x                      # wages-only labor coefficient (lower bound)
+# Upper-bound labor: wages + operating surplus. Row 202 "Operating surplus" in
+# Thailand's IO mixes pure capital returns with the mixed income of the self-
+# employed (farmers, small traders, freelancers). Adding it gives an upper
+# bound on labor compensation; the true figure is between the two.
+h_wages_plus_ms = (wages + op_surplus) / safe_x
 v = value_added / safe_x                      # value-added coefficient
-mu = Z_imp.sum(axis=0) / safe_x               # imported intermediate coefficient (column sum)
+mu = Z_imp.sum(axis=0) / safe_x               # imported intermediate coefficient
 
-# Direct+indirect per unit final demand
-output_mult = L.sum(axis=0)                   # = Σ_i L[i,j]
-labor_income_per_fd = h @ L                   # = Σ_i h_i L[i,j]
-va_per_fd = v @ L                             # = Σ_i v_i L[i,j]
-imports_per_fd = mu @ L                       # = Σ_i mu_i L[i,j]
+# Type I direct+indirect per unit final demand
+output_mult = L.sum(axis=0)
+labor_income_per_fd_low = h_wages @ L
+labor_income_per_fd_hi = h_wages_plus_ms @ L
+va_per_fd = v @ L
+imports_per_fd = mu @ L
 
 with np.errstate(divide="ignore", invalid="ignore"):
-    labor_income_mult = np.where(h > 0, labor_income_per_fd / h, np.nan)
+    labor_income_mult_low = np.where(h_wages > 0, labor_income_per_fd_low / h_wages, np.nan)
+    labor_income_mult_hi = np.where(
+        h_wages_plus_ms > 0, labor_income_per_fd_hi / h_wages_plus_ms, np.nan
+    )
 
-# Normalised linkage indices
+# ---- Type II (closed-model, household-endogenised) multipliers ----
+# Close the model with respect to households by adding one row (wage income
+# generated per unit of output, h_wages) and one column (final consumption
+# pattern divided by total wages) to A. See Miller & Blair (2009) ch. 6.
+# We use wages-only as the household-income row so the Type II multiplier is
+# directly comparable to the Type I wage-based multiplier.
+total_wages = wages.sum()
+if total_wages > 0:
+    consumption_col = private_cons / total_wages     # share of 1 baht of wages spent on commodity i
+    A_closed = np.zeros((N + 1, N + 1))
+    A_closed[:N, :N] = A
+    A_closed[:N, N] = consumption_col                # households buy commodities
+    A_closed[N, :N] = h_wages                        # each sector pays wages
+    A_closed[N, N] = 0                               # households do not buy household services from themselves
+    L_closed = np.linalg.inv(np.eye(N + 1) - A_closed)
+
+    output_mult_typeII = L_closed[:N, :N].sum(axis=0)
+    # Type II labor-income multiplier = (wage row of L_closed) / direct wage coefficient
+    wage_row = L_closed[N, :N]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        labor_income_mult_typeII = np.where(h_wages > 0, wage_row / h_wages, np.nan)
+    va_per_fd_typeII = (np.concatenate([v, [0.0]]) @ L_closed)[:N]
+    imports_per_fd_typeII = (np.concatenate([mu, [0.0]]) @ L_closed)[:N]
+else:
+    output_mult_typeII = output_mult.copy()
+    labor_income_mult_typeII = labor_income_mult_low.copy()
+    va_per_fd_typeII = va_per_fd.copy()
+    imports_per_fd_typeII = imports_per_fd.copy()
+
+# Normalised linkage indices (based on Type I)
 econ_mean_out_mult = output_mult.mean()
 backward_linkage = output_mult / econ_mean_out_mult
 row_sums_L = L.sum(axis=1)
 econ_mean_row_sum = row_sums_L.mean()
 forward_linkage = row_sums_L / econ_mean_row_sum
+
+# Back-compat aliases used in the workbook-writing section below
+h = h_wages                                    # default labor coefficient = wages-only
+labor_income_per_fd = labor_income_per_fd_low
+labor_income_mult = labor_income_mult_low
 
 # ---------------------------------------------------------------------------
 # 3. Industry-of-the-future mapping and major-sector groupings
@@ -213,20 +256,29 @@ for ind in industries:
     idxs = idxs_in_industry(ind)
     xs = x[idxs]; Xg = xs.sum()
     wt = xs / Xg                                  # output weights over the industry
-    # Weighted output & labor-income multipliers (ratio form)
+    # Type I weighted multipliers (ratio form where applicable)
     om_w = float((wt * output_mult[idxs]).sum())
-    li_w = float(np.nansum(wt * labor_income_mult[idxs]))
-    # Direct+indirect-per-baht-FD (additive form, weighted)
-    lipfd_w = float((wt * labor_income_per_fd[idxs]).sum())
-    vafd_w = float((wt * va_per_fd[idxs]).sum())
-    impfd_w = float((wt * imports_per_fd[idxs]).sum())
-    vm_w = vafd_w                                 # VA multiplier = VA generated per 1 FD
-    im_w = impfd_w                                # import multiplier (leakage per 1 FD)
+    li_w_low = float(np.nansum(wt * labor_income_mult_low[idxs]))
+    li_w_hi = float(np.nansum(wt * labor_income_mult_hi[idxs]))
+    vm_w = float((wt * va_per_fd[idxs]).sum())    # VA generated per 1 baht FD
+    im_w = float((wt * imports_per_fd[idxs]).sum())
+    # Type II (closed model w.r.t. households)
+    om_w_II = float((wt * output_mult_typeII[idxs]).sum())
+    li_w_II = float(np.nansum(wt * labor_income_mult_typeII[idxs]))
+    vm_w_II = float((wt * va_per_fd_typeII[idxs]).sum())
+    im_w_II = float((wt * imports_per_fd_typeII[idxs]).sum())
 
-    # Direct structural shares (weighted averages over member sectors)
-    labor_share = float((wt * h[idxs]).sum())
-    capital_share = float((wt * ((op_surplus[idxs] + depreciation[idxs]) / safe_x[idxs])).sum())
+    # Direct structural shares (output-weighted)
+    wages_share = float((wt * (wages[idxs] / safe_x[idxs])).sum())
+    op_surplus_share = float((wt * (op_surplus[idxs] / safe_x[idxs])).sum())
+    depr_share = float((wt * (depreciation[idxs] / safe_x[idxs])).sum())
+    indtax_share = float((wt * (indirect_tax[idxs] / safe_x[idxs])).sum())
     va_share = float((wt * v[idxs]).sum())
+    # Labor-compensation bounds (see notes)
+    labor_share_low = wages_share                              # formal wages only
+    labor_share_hi = wages_share + op_surplus_share            # wages + mixed income upper bound
+    capital_share_narrow = depr_share                          # pure depreciation = capital consumption
+    capital_share_broad = op_surplus_share + depr_share        # includes mixed income
     dom_int_share = float((wt * (Z[:, idxs].sum(axis=0) / safe_x[idxs])).sum())
     imp_int_share = float((wt * (Z_imp[:, idxs].sum(axis=0) / safe_x[idxs])).sum())
     exp_orient = float(exports[idxs].sum() / Xg) if Xg > 0 else np.nan
@@ -235,7 +287,8 @@ for ind in industries:
     imp_pen = float(imp_pen_num / imp_pen_den) if imp_pen_den > 0 else np.nan
     fwd_idx = float((wt * forward_linkage[idxs]).sum())
     bwd_idx = float((wt * backward_linkage[idxs]).sum())
-    labor_to_cap = labor_share / capital_share if capital_share > 0 else np.nan
+    labor_to_cap_low = labor_share_low / capital_share_broad if capital_share_broad > 0 else np.nan
+    labor_to_cap_hi = labor_share_hi / capital_share_narrow if capital_share_narrow > 0 else np.nan
 
     industry_summary.append({
         "industry": ind,
@@ -244,17 +297,29 @@ for ind in industries:
         "total_exports": float(exports[idxs].sum()),
         "total_wages": float(wages[idxs].sum()),
         "total_va": float(value_added[idxs].sum()),
+        # Type I
         "output_mult": om_w,
-        "labor_income_mult": li_w,
+        "labor_income_mult_low": li_w_low,
+        "labor_income_mult_hi": li_w_hi,
         "va_mult": vm_w,
         "import_mult": im_w,
-        "labor_income_per_fd": lipfd_w,
+        # Type II (household-endogenised)
+        "output_mult_II": om_w_II,
+        "labor_income_mult_II": li_w_II,
+        "va_mult_II": vm_w_II,
+        "import_mult_II": im_w_II,
+        # Structural shares
+        "wages_share": wages_share,
+        "op_surplus_share": op_surplus_share,
+        "depr_share": depr_share,
+        "indtax_share": indtax_share,
+        "va_share": va_share,
+        "labor_share_low": labor_share_low,
+        "labor_share_hi": labor_share_hi,
+        "labor_to_cap_low": labor_to_cap_low,
+        "labor_to_cap_hi": labor_to_cap_hi,
         "export_orientation": exp_orient,
         "import_penetration": imp_pen,
-        "labor_share": labor_share,
-        "capital_share": capital_share,
-        "va_share": va_share,
-        "labor_to_cap_ratio": labor_to_cap,
         "dom_intermediate_share": dom_int_share,
         "imp_intermediate_share": imp_int_share,
         "backward_linkage_idx": bwd_idx,
@@ -297,91 +362,180 @@ def set_header(ws, row, headers, widths=None):
         for j, w_ in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(j)].width = w_
 
-# ---- Sheet 1: Industry summary ----
-ws = out.active; ws.title = "Industry summary"
-ws["A1"] = "Output, labor-income, value-added and import multipliers + structural indicators"
-ws["A1"].font = Font(bold=True, size=13); ws.merge_cells("A1:U1")
-ws["A2"] = ("Thailand IO 1990 (180 sectors). Industry-of-the-future values are output-weighted "
-            "averages over member sectors (weights = total output).")
-ws.merge_cells("A2:U2")
-
-headers = [
-    "Industry of the future",
-    "# sectors",
-    "Total output (mn baht)",
-    "Total exports (mn baht)",
-    "Total wages (mn baht)",
-    "Total value added (mn baht)",
-    "Output multiplier (Type I)",
-    "Labor-income multiplier (Type I)",
-    "Value-added multiplier",
-    "Import multiplier (leakage)",
-    "Labor income generated per 1 baht FD",
-    "Export orientation (exports/output)",
-    "Import penetration (imports/supply)",
-    "Labor share of output (wages/output)",
-    "Capital share of output (op.surplus+depr./output)",
-    "Value-added share of output",
-    "Labor-to-capital ratio",
-    "Domestic intermediate share",
-    "Imported intermediate share",
-    "Backward linkage index (1.0=avg)",
-    "Forward linkage index (1.0=avg)",
-]
-widths = [26, 9] + [16]*4 + [14]*4 + [16] + [14]*4 + [12, 14, 14, 14, 14, 14]
-set_header(ws, 4, headers, widths=widths)
-
 fmt_int = "#,##0"
 fmt_4 = "0.0000"
 fmt_pct = "0.00%"
 
-for r, row in enumerate(industry_summary, start=5):
+# ---- Sheet 1: Methodology & caveats ----
+ws_m = out.active; ws_m.title = "Methodology & caveats"
+ws_m["A1"] = "Methodology and caveats"
+ws_m["A1"].font = Font(bold=True, size=14)
+ws_m.merge_cells("A1:A1")
+ws_m.column_dimensions["A"].width = 140
+
+methodology_lines = [
+    ("Source table", True),
+    ("Thailand Input-Output Table 1990, 180-sector classification (sheet '1990' in IO1990 180 sectors.xlsx, using "
+     "the 'New purchaser price' column as the corrected series). Figures are in nominal million baht at purchaser "
+     "prices of 1990. Sector mapping to the 5 industries of the future is reused from the 2021 workbook since the "
+     "180-sector classification is identical across the two years; 121 of 180 sectors are mapped, the remainder "
+     "are treated as 'Other'.",
+     False),
+    ("", False),
+    ("Transformations", True),
+    ("1. Domestic producer-price intermediate flows:  Z[i,j] = PURCHASER − WHOLESALE − RETAIL − TRANSPORT − IMPORT. "
+     "The Thai IO stores margin components as negative values in the trade (rows 145–146) and transport (rows 149–156) "
+     "rows, so this formula both strips margins from commodity cells and reallocates them to trade/transport rows "
+     "in a single step. Verified: column sums of WHOLESALE/RETAIL/TRANSPORT across the 180 intermediate rows equal 0.", False),
+    ("2. Imported intermediate flows Z_imp = IMPORT (per cell). Totals at col 409 in sector rows are stored as negative "
+     "(supply-accounting convention) and are absolute-valued when used as an indicator.", False),
+    ("3. Value added, output, and final-demand vectors come directly from rows 201–210 and cols 301–700 respectively.", False),
+    ("", False),
+    ("Multipliers (Type I, open Leontief model)", True),
+    ("  A = Z / x (column-normalised),  L = (I − A)^−1.", False),
+    ("  Output multiplier m^X[j] = Σ_i L[i,j].  Direct + indirect output generated economy-wide per 1 baht of final demand.", False),
+    ("  Value-added multiplier = (v'L)[j] with v = VA/x. Total VA generated per 1 baht final demand.", False),
+    ("  Import multiplier = (μ'L)[j] with μ = imported intermediates / x. Imports induced per 1 baht final demand.", False),
+    ("  Labor-income multiplier (ratio) = (h'L)[j] / h[j]. See caveat on labor measurement below — two bounds reported.", False),
+    ("", False),
+    ("Multipliers (Type II, closed model w.r.t. households)", True),
+    ("  Closes A against households by adding one row (h = wages/x, wages paid per unit of sector output) and one column "
+     "(c = private_consumption / total_wages, spending by 1 baht of wages on each commodity). "
+     "L_closed = (I − A_closed)^−1 in (N+1)×(N+1). Type II multipliers include the induced-consumption round and are "
+     "always ≥ Type I. They are appropriate when a final-demand shock is expected to raise household income and spending.", False),
+    ("", False),
+    ("Aggregation to industries of the future", True),
+    ("Industry multipliers are output-weighted averages over member sectors (weights = x_j). "
+     "Decompositions by source major sector are Σ_{j in industry} w_j · Σ_{i in major sector} L[i,j], so the column "
+     "sums equal the industry's multiplier. Major sectors: 18 groups covering all 180 sectors.", False),
+    ("", False),
+    ("Key caveats", True),
+    ("A. Labor measurement. Row 201 'Wages and salaries' captures only formal employee compensation. The labor of "
+     "self-employed workers (smallholder farmers, small traders, freelancers) flows to row 202 'Operating surplus' "
+     "as mixed income and cannot be separated from pure capital returns in the Thai IO. Consequence: the "
+     "wages-only labor-income multiplier UNDER-states labor dependency in agriculture, tourism-adjacent personal "
+     "services, and creative industries. The bias is likely LARGER in 1990 than in 2021 because formal-sector "
+     "employment was a much smaller share of total employment in 1990 Thailand. We therefore report TWO bounds on "
+     "every labor indicator:", False),
+    ("    • Lower bound (wages only) — row 201 / output.", False),
+    ("    • Upper bound (wages + operating surplus) — row 201 + row 202 / output. "
+     "This OVER-states labor by including pure capital returns for capital-intensive sectors.", False),
+    ("The true labor share lies between the two. The gap is especially wide for agriculture in 1990.", False),
+    ("", False),
+    ("B. No employment headcount data. The IO file contains no jobs or FTE count by sector, so a physical "
+     "employment multiplier (workers per million baht of final demand) cannot be computed. The labor-income "
+     "multiplier is a baht-denominated proxy, not a headcount.", False),
+    ("", False),
+    ("C. Temporal comparability (1990 vs 2021). Both tables are in nominal prices of their respective year. "
+     "Multipliers and shares are dimensionless and directly comparable; absolute output levels are NOT. "
+     "Industry-of-the-future definitions are anachronistic for 1990 (e.g., 'Digital services' in 1990 is post "
+     "office + pre-internet business services). 1990 industry figures should be read as 'the same sector bundle "
+     "on 1990 technology', not as a 1990 version of today's industry.", False),
+    ("", False),
+    ("D. Leontief assumptions. Fixed input proportions, linear response, no price or capacity constraints, "
+     "joint production excluded. Standard assumptions for IO multipliers but worth recalling.", False),
+    ("", False),
+    ("E. Aggregation bias. Weighted averaging over disaggregated multipliers differs slightly from aggregating the "
+     "IO table first and then inverting. Agribusiness shows the largest gap (~3%) because of strong intra-group "
+     "chains; other industries differ by <1%. We report the disaggregated-then-averaged version; see analysis "
+     "script comments for the alternative.", False),
+]
+row = 2
+for line, is_header in methodology_lines:
+    c = ws_m.cell(row=row, column=1, value=line)
+    if is_header:
+        c.font = Font(bold=True, color="305496", size=11)
+    c.alignment = Alignment(wrap_text=True, vertical="top")
+    if line and not is_header:
+        ws_m.row_dimensions[row].height = 45
+    row += 1
+
+# ---- Sheet 2: Industry summary ----
+ws = out.create_sheet("Industry summary")
+ws["A1"] = "Multipliers and structural indicators by industry of the future"
+ws["A1"].font = Font(bold=True, size=13); ws.merge_cells("A1:Z1")
+ws["A2"] = ("Thailand IO 1990 (180 sectors). Industry values are output-weighted averages over member sectors "
+            "(weights = total output). Type I = open Leontief; Type II = household-endogenised closed Leontief. "
+            "Labor-income bounds: Low = wages only; High = wages + operating surplus (see methodology).")
+ws.merge_cells("A2:Z2")
+
+# Group multi-column headers into two rows for readability
+group_hdr = [
+    ("Industry / sector count / size", 1, 6),
+    ("Type I multipliers", 7, 11),
+    ("Type II multipliers (induced)", 12, 15),
+    ("Labor compensation bounds", 16, 19),
+    ("Value-added structure", 20, 23),
+    ("External orientation", 24, 25),
+    ("Intermediate structure & linkages", 26, 29),
+]
+for label, c_start, c_end in group_hdr:
+    cell = ws.cell(row=4, column=c_start, value=label)
+    cell.font = hdr_font
+    cell.fill = PatternFill("solid", fgColor="4472C4")
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    if c_end > c_start:
+        ws.merge_cells(start_row=4, start_column=c_start, end_row=4, end_column=c_end)
+
+headers = [
+    "Industry of the future", "# sectors", "Total output (mn baht)", "Total exports (mn baht)",
+    "Total wages (mn baht)", "Total VA (mn baht)",
+    # Type I multipliers
+    "Output mult", "Labor-inc mult (Low: wages only)", "Labor-inc mult (High: wages+OS)",
+    "VA mult", "Import mult (leakage)",
+    # Type II multipliers
+    "Output mult (II)", "Labor-inc mult (II, wages only)", "VA mult (II)", "Import mult (II)",
+    # Labor compensation bounds
+    "Wages/output", "Op.surplus/output", "Labor share LOW (wages)", "Labor share HIGH (wages+OS)",
+    # VA structure
+    "Depreciation/output", "Indirect tax/output", "VA/output", "Labor-to-capital (low/broad)",
+    # External
+    "Export orientation", "Import penetration",
+    # Intermediate & linkages
+    "Dom. intermediate share", "Imp. intermediate share",
+    "Backward linkage idx (1=avg)", "Forward linkage idx (1=avg)",
+]
+widths = [26, 7] + [15]*4 + [11, 15, 15, 11, 13] + [11, 15, 11, 13] + [12, 13, 15, 15] + [14, 13, 11, 16] + [12, 13] + [15, 15, 15, 15]
+set_header(ws, 5, headers, widths=widths)
+
+for r, row in enumerate(industry_summary, start=6):
     ws.cell(row=r, column=1, value=row["industry"]).font = bold
     ws.cell(row=r, column=2, value=row["n_sectors"])
     ws.cell(row=r, column=3, value=row["total_output"]).number_format = fmt_int
     ws.cell(row=r, column=4, value=row["total_exports"]).number_format = fmt_int
     ws.cell(row=r, column=5, value=row["total_wages"]).number_format = fmt_int
     ws.cell(row=r, column=6, value=row["total_va"]).number_format = fmt_int
+    # Type I
     ws.cell(row=r, column=7, value=row["output_mult"]).number_format = fmt_4
-    ws.cell(row=r, column=8, value=row["labor_income_mult"]).number_format = fmt_4
-    ws.cell(row=r, column=9, value=row["va_mult"]).number_format = fmt_4
-    ws.cell(row=r, column=10, value=row["import_mult"]).number_format = fmt_4
-    ws.cell(row=r, column=11, value=row["labor_income_per_fd"]).number_format = fmt_4
-    ws.cell(row=r, column=12, value=row["export_orientation"]).number_format = fmt_pct
-    ws.cell(row=r, column=13, value=row["import_penetration"]).number_format = fmt_pct
-    ws.cell(row=r, column=14, value=row["labor_share"]).number_format = fmt_pct
-    ws.cell(row=r, column=15, value=row["capital_share"]).number_format = fmt_pct
-    ws.cell(row=r, column=16, value=row["va_share"]).number_format = fmt_pct
-    ws.cell(row=r, column=17, value=row["labor_to_cap_ratio"]).number_format = fmt_4
-    ws.cell(row=r, column=18, value=row["dom_intermediate_share"]).number_format = fmt_pct
-    ws.cell(row=r, column=19, value=row["imp_intermediate_share"]).number_format = fmt_pct
-    ws.cell(row=r, column=20, value=row["backward_linkage_idx"]).number_format = fmt_4
-    ws.cell(row=r, column=21, value=row["forward_linkage_idx"]).number_format = fmt_4
+    ws.cell(row=r, column=8, value=row["labor_income_mult_low"]).number_format = fmt_4
+    ws.cell(row=r, column=9, value=row["labor_income_mult_hi"]).number_format = fmt_4
+    ws.cell(row=r, column=10, value=row["va_mult"]).number_format = fmt_4
+    ws.cell(row=r, column=11, value=row["import_mult"]).number_format = fmt_4
+    # Type II
+    ws.cell(row=r, column=12, value=row["output_mult_II"]).number_format = fmt_4
+    ws.cell(row=r, column=13, value=row["labor_income_mult_II"]).number_format = fmt_4
+    ws.cell(row=r, column=14, value=row["va_mult_II"]).number_format = fmt_4
+    ws.cell(row=r, column=15, value=row["import_mult_II"]).number_format = fmt_4
+    # Labor compensation
+    ws.cell(row=r, column=16, value=row["wages_share"]).number_format = fmt_pct
+    ws.cell(row=r, column=17, value=row["op_surplus_share"]).number_format = fmt_pct
+    ws.cell(row=r, column=18, value=row["labor_share_low"]).number_format = fmt_pct
+    ws.cell(row=r, column=19, value=row["labor_share_hi"]).number_format = fmt_pct
+    # VA structure
+    ws.cell(row=r, column=20, value=row["depr_share"]).number_format = fmt_pct
+    ws.cell(row=r, column=21, value=row["indtax_share"]).number_format = fmt_pct
+    ws.cell(row=r, column=22, value=row["va_share"]).number_format = fmt_pct
+    ws.cell(row=r, column=23, value=row["labor_to_cap_low"]).number_format = fmt_4
+    # External
+    ws.cell(row=r, column=24, value=row["export_orientation"]).number_format = fmt_pct
+    ws.cell(row=r, column=25, value=row["import_penetration"]).number_format = fmt_pct
+    # Intermediate & linkages
+    ws.cell(row=r, column=26, value=row["dom_intermediate_share"]).number_format = fmt_pct
+    ws.cell(row=r, column=27, value=row["imp_intermediate_share"]).number_format = fmt_pct
+    ws.cell(row=r, column=28, value=row["backward_linkage_idx"]).number_format = fmt_4
+    ws.cell(row=r, column=29, value=row["forward_linkage_idx"]).number_format = fmt_4
 
-# Notes
-note_row = 5 + len(industry_summary) + 2
-notes = [
-    "Definitions:",
-    "  Output multiplier (Type I): column sum of the Leontief inverse L = (I - A)^-1. Total output generated economy-wide per 1 baht of final demand.",
-    "  Labor-income multiplier (Type I): (h'L)[j] / h[j] with h = wages / output. Ratio of direct+indirect labor income to direct labor income.",
-    "  Labor income generated per 1 baht FD: additive version of labor impact, (h'L)[j]. Decomposed below by source major sector.",
-    "  Value-added multiplier: (v'L)[j] with v = value_added / output. Value added generated economy-wide per 1 baht final demand.",
-    "  Import multiplier: imported intermediate inputs induced per 1 baht final demand (leakage).",
-    "  Export orientation: sector exports (col 305) divided by sector total output (row 210).",
-    "  Import penetration: total imports (col 409) divided by total supply (col 700).",
-    "  Labor / capital shares: wages, operating surplus + depreciation as a share of sector total output.",
-    "  Backward linkage index: sector output multiplier divided by the economy-wide mean (values > 1 indicate stronger-than-average demand-pull on suppliers).",
-    "  Forward linkage index: sector row sum of L divided by the economy-wide mean (values > 1 indicate stronger-than-average supply to downstream users).",
-    "",
-    "Employment limitation:",
-    "  The IO file contains no employment (headcount or FTE) data. Wages (row 201) are used as the labor-compensation proxy; the",
-    "  'labor-income multiplier' above is NOT a physical employment multiplier. Provide sector-level employment to swap h and obtain one.",
-]
-for k, line in enumerate(notes):
-    c = ws.cell(row=note_row + k, column=1, value=line)
-    if line.endswith(":"):
-        c.font = bold
-    ws.merge_cells(start_row=note_row + k, start_column=1, end_row=note_row + k, end_column=21)
+ws.freeze_panes = "B6"
 
 # ---- Sheet 2: Output multiplier decomposition by major sector ----
 ws2 = out.create_sheet("Output mult decomposition")
@@ -532,11 +686,11 @@ out.save(OUT)
 # 6. Console summary
 # ---------------------------------------------------------------------------
 print("Industry-of-the-future multipliers (Type I, output-weighted averages):\n")
-hdr = f"{'Industry':<26}{'OutputM':>9}{'LaborInc':>10}{'VA M':>8}{'ImportM':>9}  {'ExpOrt':>7} {'ImpPen':>7} {'Labor%':>7} {'Cap%':>6}"
+hdr = f"{'Industry':<26}{'OutputM':>9}{'LaborI_lo':>11}{'LaborI_hi':>11}{'VA M':>8}{'ImportM':>9}  {'ExpOrt':>7} {'ImpPen':>7} {'Wage%':>7} {'VA%':>6}"
 print(hdr); print("-"*len(hdr))
 for r in industry_summary:
-    print(f"{r['industry']:<26}{r['output_mult']:>9.4f}{r['labor_income_mult']:>10.4f}{r['va_mult']:>8.4f}{r['import_mult']:>9.4f}  "
-          f"{r['export_orientation']:>7.1%} {r['import_penetration']:>7.1%} {r['labor_share']:>7.1%} {r['capital_share']:>6.1%}")
+    print(f"{r['industry']:<26}{r['output_mult']:>9.4f}{r['labor_income_mult_low']:>11.4f}{r['labor_income_mult_hi']:>11.4f}{r['va_mult']:>8.4f}{r['import_mult']:>9.4f}  "
+          f"{r['export_orientation']:>7.1%} {r['import_penetration']:>7.1%} {r['wages_share']:>7.1%} {r['va_share']:>6.1%}")
 
 print("\nOutput multiplier decomposition (columns sum to industry output multiplier):\n")
 col_hdr = f"{'Major sector':<42}  " + "".join(f"{ind[:12]:>13}" for ind in industries)
