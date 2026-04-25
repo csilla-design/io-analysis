@@ -23,7 +23,7 @@ Labor-income decomposition (on labor income generated per baht FD):
   Σ_{j in g} (x_j / X_g) · Σ_{i in m} h[i]·L[i,j]  (sums to industry direct+indirect labor income)
 
 Indicators at industry level (output-weighted averages unless noted):
-  - export_orientation = exports (col 305) / total output
+  - export_orientation = exports (cols 305+306) / total supply (col 700)
   - import_penetration = total imports (col 409) / total supply (col 700)
   - labor_share (row 201 / x) and capital_share ((row 202 + row 203) / x)
   - labor_to_capital_ratio
@@ -292,10 +292,16 @@ for ind in industries:
     capital_share_broad = op_surplus_share + depr_share        # includes mixed income
     dom_int_share = float((wt * (Z[:, idxs].sum(axis=0) / safe_x[idxs])).sum())
     imp_int_share = float((wt * (Z_imp[:, idxs].sum(axis=0) / safe_x[idxs])).sum())
-    exp_orient = float(exports[idxs].sum() / Xg) if Xg > 0 else np.nan
+    # Export orientation and import penetration share the same denominator
+    # (total supply = output + |imports|, col 700). Using output alone in the
+    # denominator yields ratios > 100% for re-export sectors (where imported
+    # goods pass through Thailand and are re-exported with little local
+    # value-add); using total supply keeps both indicators bounded and on
+    # the same supply basis. See "Export-orientation convention" caveat.
+    Xs_supply = total_supply[idxs].sum()
+    exp_orient = float(exports[idxs].sum() / Xs_supply) if Xs_supply > 0 else np.nan
     imp_pen_num = total_imports[idxs].sum()
-    imp_pen_den = total_supply[idxs].sum()
-    imp_pen = float(imp_pen_num / imp_pen_den) if imp_pen_den > 0 else np.nan
+    imp_pen = float(imp_pen_num / Xs_supply) if Xs_supply > 0 else np.nan
     fwd_idx = float((wt * forward_linkage[idxs]).sum())
     bwd_idx = float((wt * backward_linkage[idxs]).sum())
     labor_to_cap_low = labor_share_low / capital_share_broad if capital_share_broad > 0 else np.nan
@@ -447,6 +453,18 @@ methodology_lines = [
      "IO table first and then inverting. Agribusiness shows the largest gap (~3%) because of strong intra-group "
      "chains; other industries differ by <1%. We report the disaggregated-then-averaged version; see analysis "
      "script comments for the alternative.", False),
+    ("", False),
+    ("F. Export-orientation convention. Export orientation is reported as exports (cols 305 + 306) divided by "
+     "TOTAL SUPPLY (col 700 = domestic output + imports), the same denominator used for import penetration. The "
+     "more familiar ratio exports/output is misleading for sectors that mainly re-export imported goods through "
+     "domestic trade margins (e.g., 035 'Other non-ferrous metals', 037 'Chemical fertilizers', 071 'Knitting'): "
+     "the exports/output ratio there exceeds 100%, sometimes by orders of magnitude, because the numerator "
+     "includes the gross re-exported value while the denominator only captures the small domestic processing "
+     "margin. Switching to exports/total-supply puts the ratio on a bounded supply basis (supply identity: "
+     "total supply = total demand, with exports as one component of demand) and makes export and import "
+     "indicators directly comparable. A handful of sectors still slightly exceed 100% due to negative inventory "
+     "changes or trade-margin allocations in the original table; these are reported as-is rather than capped.",
+     False),
 ]
 row = 2
 for line, is_header in methodology_lines:
@@ -641,8 +659,9 @@ for i, code in enumerate(sector_codes):
     va_sh = v[i]
     dom_int = Z[:, i].sum() / xi if xi > 0 else np.nan
     imp_int = Z_imp[:, i].sum() / xi if xi > 0 else np.nan
-    exp_or = exports[i] / xi if xi > 0 else np.nan
-    imp_pen = total_imports[i] / total_supply[i] if total_supply[i] > 0 else np.nan
+    sup_i = total_supply[i]
+    exp_or = exports[i] / sup_i if sup_i > 0 else np.nan
+    imp_pen = total_imports[i] / sup_i if sup_i > 0 else np.nan
     lab_to_cap = labor_sh / cap_sh if cap_sh > 0 else np.nan
 
     ws4.cell(row=r, column=1, value=code)
